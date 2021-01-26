@@ -1,0 +1,12 @@
+# Use common context and name
+- valuesFiles:
+  - dev-values.yaml
+  - prd-values.yaml
+  queries:
+  - .secrets[].value
+  - .secretMessage
+  scope: strict
+  namespace: my-namespace
+  name: my-secret
+  controllerName: sealed-secrets
+  context: kind-kind

@@ -1,0 +1,7 @@
+secrets:
+- name: db_password
+  value: 
+- name: api_secret
+  value:
+message: production
+secretMessage:

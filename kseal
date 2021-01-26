@@ -1,0 +1,757 @@
+#!/bin/bash -e
+
+encrypt=''
+decrypt=''
+
+verbose=''
+
+context_ours=''
+context_theirs=''
+controller_name=''
+
+config=''
+values_files=()
+queries=()
+scope=''
+namespace=''
+name=''
+extract_emb=''
+
+print_secrets=''
+sealed_marker='[sealed]'
+infer_from=''
+inferred_scope=''
+inferred_namespace=''
+inferred_name=''
+
+update=''
+private_key_for_decryption_while_updating=''
+sealed_secrets_key_for_decryption_while_updating=''
+
+private_key=''
+sealed_secrets_key=''
+
+yq_path="$(which yq)" || :
+kubeseal_path="$(which kubeseal)" || :
+kubectl_path="$(which kubectl)" || :
+base64_d=$([[ "$(uname -s)" =~ ^Linux ]] && echo "base64 -d" || echo "base64 -D")
+
+
+usage() {
+  cat << EOS
+Usage:
+  Encryption:
+    * Select encryption targets
+      * By a config file (See README on the GitHub repo for config format)
+        * `kseal enc -C .kseal.yaml`
+      * By arguments
+        * `kseal enc -f values1.yaml -f values2.yaml -q '.secrets[]' -q '.otherSecrets[].value' -n my-namespace -N my-secret`
+    * How to encrypt
+      * By a local key
+        * (Not implemented)
+      * By a remote key
+        * Can change remote by context
+  Decryption:
+    * Select decryption targets
+      * By a config file (See README on the GitHub repo for config format)
+        * `kseal dec -C .kseal.yaml`
+      * By arguments
+        * With embedded comments
+          * `kseal dec -f values3.yaml`
+        * Without embedded comments
+          * `kseal dec -f values3.yaml -q '.otherSecrets[].value' -n my-namespace -N my-secret`
+    * How to decrypt
+      * By a local private key
+        * `kseal dec -f values3.yaml -p private-key.yaml`
+      * By a specified remote key
+        * `kseal dec -f values3.yaml -S sealed-secrets-key`
+          * Can change remote by context
+      * By any one of remote keys (brute force by sealedsecrets.bitnami.com/sealed-secrets-key label)
+        * `kseal dec -f values3.yaml`
+          * Can change remote by context
+Subcommands:
+  e, enc, encrypt             Encryption mode
+  d, dec, decrypt             Decryption mode
+Flags:
+  -h, --help                  Print usage
+  -v, --verbose               Enable verbose logs
+  -c, --context               kubeconfig context
+      --controller-name       sealed-secrets-controller name
+
+  -C, --config                Path to a config file
+  -f, --values                Target values file (Can be multiple)
+  -q, --query                 YAML query for secrets (Can be multiple). See https://mikefarah.gitbook.io/yq/
+  -s, --scope                 sealed-secret scope (Default: strict). See https://github.com/bitnami-labs/sealed-secrets#scopes
+  -n, --namespace             Namespace for secret
+  -N, --name                  Secret name
+  -e, --extract-emb           [For Decryption] Extract scope, namespace, name, etc. from embedded comments
+
+  -P, --print-secrets         Print decrypted or before-encrypting secrets
+      --sealed-marker         Marker text for embedding meta info of encryption (Default: [sealed])
+      --infer-from            [For Encryption] Path to a secret file which will be used for inferring scope, namespace, and name
+      --disable-emb           [For Encryption] Disable embedded comments when encryption
+  -u, --update                [For Encryption] Update even if already encrypted.
+                              Decryption for updating will work based on embedded comment.
+                              If want to use different keys between encryption and decryption,
+                              specify optional key for decryption with the following flags.
+                              * --private-key-for-decryption-while-updating
+                              * --sealed-secrets-key-for-decryption-while-updating
+
+  -p, --private-key           [For Decryption] Private key for decryption
+  -S, --sealed-secrets-key    [For Decryption] Secret sealed-secrets-key name for decryption
+
+      --yq                    Path to yq (Default: yq in \$PATH)
+                              Expects https://github.com/mikefarah/yq
+      --kubeseal              Path to kubeseal (Default: kubeseal in \$PATH)
+      --kubectl               Path to kubectl (Default: kubectl in \$PATH)
+EOS
+}
+
+log() {
+  echo "$1" 1>&2 || :
+}
+
+log_v() {
+  [[ "${verbose}" != '' ]] && echo "$1" 1>&2 || :
+}
+
+err() {
+  echo -e "$1\nUse \"kseal --help\" for more information" 1>&2
+  exit 1
+}
+
+while [[ -n "$1" ]]; do
+  case "$1" in
+    --help | -h )
+      usage
+      exit 0 ;;
+
+
+    e | enc | encrypt )
+      encrypt='1' ;;
+    d | dec | decrypt )
+      decrypt='1' ;;
+
+
+    --verbose | -v )
+      verbose='1' ;;
+    --context | -c )
+      tmp="$2"
+      if [[ "${tmp}" =~ : ]]; then
+        context_ours="${tmp%:*}"
+        context_theirs="${tmp#*:}"
+      else
+        context_ours="${tmp}"
+        context_theirs="${tmp}"
+      fi; shift ;;
+    --context=* | -c=* )
+      tmp="$1"
+      tmp="${tmp#*=}"
+      if [[ "${tmp}" =~ : ]]; then
+        context_ours="${tmp%:*}"
+        context_theirs="${tmp#*:}"
+      else
+        context_ours="${tmp}"
+        context_theirs="${tmp}"
+      fi ;;
+    --controller-name )
+      controller_name="$2"; shift ;;
+    --controller-name=* )
+      tmp="$1"
+      controller_name="${tmp#*=}" ;;
+
+
+    --config | -C )
+      config="$(realpath $2)"; shift ;;
+    --config=* | -C=* )
+      tmp="$1"
+      config+="$(realpath ${tmp#*=})" ;;
+
+    --values | -f )
+      values_files+=("$(realpath $2)"); shift ;;
+    --values=* | -f=* )
+      tmp="$1"
+      values_files+=("$(realpath ${tmp#*=})") ;;
+
+    --query | -q )
+      queries+=("$2"); shift ;;
+    --query=* | -q=* )
+      tmp="$1"
+      queries+=("${tmp#*=}") ;;
+
+    --scope | -s )
+      scope="$2"; shift ;;
+    --scope=* | -s=* )
+      tmp="$1"
+      scope="${tmp#*=}" ;;
+    --namespace | -n )
+      namespace="$2"; shift ;;
+    --namespace=* | -n=* )
+      tmp="$1"
+      namespace="${tmp#*=}" ;;
+    --name | -N )
+      name="$2"; shift ;;
+    --name=* | -N=* )
+      tmp="$1"
+      name="${tmp#*=}" ;;
+
+    --extract-emb | -e )
+      extract_emb='1' ;;
+
+
+    --print-secrets | -P )
+      print_secrets='1' ;;
+    --sealed-marker )
+      sealed_marker="$2"; shift ;;
+    --sealed-marker=* )
+      tmp="$1"
+      sealed_marker="${tmp#*=}" ;;
+    --infer-from )
+      infer_from="$(realpath $2)"; shift ;;
+    --infer-from=* )
+      tmp="$1"
+      infer_from="$(realpath ${tmp#*=})" ;;
+    --disable-emb )
+      disable_emb='1' ;;
+
+    --update | -u )
+      update='1' ;;
+    --private-key-for-decryption-while-updating )
+      private_key_for_decryption_while_updating="$(realpath $2)"; shift ;;
+    --private-key-for-decryption-while-updating=* )
+      tmp="$1"
+      private_key_for_decryption_while_updating="$(realpath ${tmp#*=})" ;;
+    --sealed-secrets-key-for-decryption-while-updating )
+      sealed_secrets_key_for_decryption_while_updating="$2"; shift ;;
+    --sealed-secrets-key-for-decryption-while-updating=* )
+      tmp="$1"
+      sealed_secrets_key_for_decryption_while_updating="${tmp#*=}" ;;
+
+
+    --private-key | -p )
+      private_key="$(realpath $2)"; shift ;;
+    --private-key=* | -p=* )
+      tmp="$1"
+      private_key="$(realpath ${tmp#*=})" ;;
+    --sealed-secrets-key | -S )
+      sealed_secrets_key="$2"; shift ;;
+    --sealed-secrets-key=* | -S=* )
+      tmp="$1"
+      sealed_secrets_key="${tmp#*=}" ;;
+
+
+    --yq )
+      yq_path="$(realpath $2)"; shift ;;
+    --yq=* )
+      tmp="$1"
+      yq_path="$(realpath ${tmp#*=})" ;;
+    --kubeseal )
+      kubeseal_path="$(realpath $2)"; shift ;;
+    --kubeseal=* )
+      tmp="$1"
+      kubeseal_path="$(realpath ${tmp#*=})" ;;
+    --kubectl )
+      kubectl_path="$(realpath $2)"; shift ;;
+    --kubectl=* )
+      tmp="$1"
+      kubectl_path="$(realpath ${tmp#*=})" ;;
+    
+    * )
+      err "Invalid arguments: $@" ;;
+  esac
+  shift
+done
+
+
+validate_scope() {
+  local scope="$1"
+  local namespace="$2"
+  local name="$3"
+
+  # scope is required
+  # scope=cluster-wide: no requirements
+  # scope=namespace-wide: need namespace
+  # scope=strict: need namespace and name
+
+  if [[ "${scope}" = 'namespace-wide' && "${namespace}" = '' ]]; then
+    err 'scope is namespace-wide but namespace is empty'
+  fi
+  if [[ "${scope}" = 'strict' || "${scope}" = '' ]]; then
+    if [[ "${namespace}" = '' ]]; then
+      err 'scope is strict but namespace is empty'
+    fi
+    if [[ "${name}" = '' ]]; then
+      err 'scope is strict but name is empty'
+    fi
+  fi
+}
+
+unseal() {
+  local path="$1"
+  local encrypted="$2"
+  local scope="$3"
+  local namespace="$4"
+  local name="$5"
+  local context_ours="$6"
+  local context_theirs="$7"
+  local private_key="$8"
+  local sealed_secrets_key="$9"
+
+  validate_scope "${scope}" "${namespace}" "${name}"
+
+  local sealed_secret=$(cat << EOS
+apiVersion: bitnami.com/v1alpha1
+kind: SealedSecret
+metadata:
+  annotation:
+    $([[ "${scope}" = 'cluster-wide' ]] && echo "sealedsecrets.bitnami.com/cluster-wide: \"true\"")
+    $([[ "${scope}" = 'namespace-wide' ]] && echo "sealedsecrets.bitnami.com/namespace-wide: \"true\"")
+  $([[ "${namespace}" =~ ^(null)?$ ]] || echo "namespace: ${namespace}")
+  $([[ "${name}" =~ ^(null)?$ ]] || echo "name: ${name}")
+spec:
+  encryptedData:
+    "${path}": ${encrypted}
+EOS
+)
+  local mode=''
+  local secret=''
+  if [ "${private_key}" != '' ]; then # use a specified local private key
+    mode='specified_local_key'
+    secret=$(echo "${sealed_secret}" \
+    | "${kubeseal_path}" \
+      --recovery-unseal \
+      --format=yaml \
+      --recovery-private-key="${private_key}" \
+      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") && :)
+  elif [ "${sealed_secrets_key}" != '' ]; then # get a private key by name from remote and use it
+    mode='specified_remote_key'
+    secret=$(echo "${sealed_secret}" \
+    | "${kubeseal_path}" \
+      --recovery-unseal \
+      --format=yaml \
+      --recovery-private-key=<(kubectl -n=kube-system get secret "${sealed_secrets_key}" -o=yaml) \
+      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") && :)
+  else # get private keys by name from remote and test&use it
+    mode='remote_keys'
+    local ns_key=($(kubectl get -A --context="${context_ours}" secret -l=sealedsecrets.bitnami.com/sealed-secrets-key -o=jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name} {end}'))
+    local len="${#ns_key[@]}"
+    local i=0
+    for ((i=0; i<${len}; i+=2)); do
+      sealed_secrets_key="${ns_key[$i+1]}"
+      secret=$(echo "${sealed_secret}" \
+      | "${kubeseal_path}" \
+        --recovery-unseal \
+        --format=yaml \
+        --recovery-private-key=<(kubectl -n="${ns_key[$i]}" get secret "${ns_key[$i+1]}" -o=yaml) \
+        $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") 2>/dev/null && :)
+
+      [ "${secret}" != '' ] \
+      && break \
+      || sealed_secrets_key=$(kubectl get -A --context="${context_ours}" secret -l=sealedsecrets.bitnami.com/sealed-secrets-key -o=jsonpath='{range .items[*]}{.metadata.name},{end}')
+    done
+  fi
+
+  case "${mode}" in
+    specified_local_key )
+      method="scope=${scope}, namespace=${namespace}, name=${name}, context=${context_ours}:${context_theirs}, private-key=${private_key}" ;;
+    specified_remote_key )
+      method="scope=${scope}, namespace=${namespace}, name=${name}, context=${context_ours}:${context_theirs}, sealed-secret-key=${sealed_secrets_key}" ;;
+    remote_keys )
+      method="scope=${scope}, namespace=${namespace}, name=${name}, context=${context_ours}:${context_theirs}, sealed-secret-key=[${sealed_secrets_key}]" ;;
+  esac
+
+  if [ "${secret}" = '' ]; then
+    log "Failed to decrypt ${values_file} (${path}) by ${method}"
+  else
+    if [[ "${print_secrets}" != '' ]]; then
+      local decrypted=$(echo "${secret}" | "${yq_path}" e ".data.\"${path}\"" - | ${base64_d})
+      log "Successfully decrypted ${values_file} (${path}) by ${method}: ${decrypted}"
+    else
+      log "Successfully decrypted ${values_file} (${path}) by ${method}"
+    fi
+  fi
+
+  echo "${secret}"
+}
+
+unseal_by_comment() {
+  # unseal all commented fields
+  local values_file="$1"
+  local scope="$2"
+  local namespace="$3"
+  local name="$4"
+  local context_ours="$5"
+  local context_theirs="$6"
+  local private_key="$7"
+  local sealed_secrets_key="$8"
+
+                                          # extract by the marker                                                                 # extract a part of a comment
+  local encrypteds=$("${yq_path}" e "(.. | select(lineComment == \"${sealed_marker}*\") | [{\"path\":path, \"value\":., \"prop\":(lineComment | split(\"${sealed_marker} \") | .1)}]" "${values_file}" \
+  `# convert embedded comments into yaml` \
+  | sed -e "s/^  prop: '/  prop: /" -e "s/}'\$/}/" -e "s/''/'/g" \
+  | "${yq_path}" e '.' -)
+
+  local len=$(echo "${encrypteds}" | "${yq_path}" e 'length' -)
+  local i=0
+  for ((i=0; i<${len}; i++)); do
+    local c=$(echo "${encrypteds}" | "${yq_path}" e ".[${i}]" -)
+    local path=.$(echo "${c}" | "${yq_path}" e '.path | join(".")' -)
+    local encrypted=$("${yq_path}" e "${path}" "${values_file}")
+    local _scope="${scope}"
+    local _namespace="${namespace}"
+    local _name="${name}"
+    local _context_theirs="${context_theirs}"
+    local _private_key="${private_key}"
+    local _sealed_secrets_key="${sealed_secrets_key}"
+    [ "${_scope}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.scope' - &>/dev/null) && \
+      _scope=$(echo "${c}" | "${yq_path}" e '.prop.scope' -)
+    [ "${_namespace}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.namespace' - &>/dev/null) && \
+      _namespace=$(echo "${c}" | "${yq_path}" e '.prop.namespace' -)
+    [ "${_name}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.name' - &>/dev/null) && \
+      _name=$(echo "${c}" | "${yq_path}" e '.prop.name' -)
+    [ "${_context_theirs}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.context' - &>/dev/null) && \
+      _context_theirs=$(echo "${c}" | "${yq_path}" e '.prop.context' -)
+    [ "${_private_key}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.privateKey' - &>/dev/null) && \
+      _private_key=$(echo "${c}" | "${yq_path}" e '.prop.privateKey' -)
+    [ "${_sealed_secrets_key}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.sealedSecretsKey' - &>/dev/null) && \
+      _sealed_secrets_key=$(echo "${c}" | "${yq_path}" e '.prop.sealedSecretsKey' -)
+
+    unseal "${path}" "${encrypted}" "${_scope}" "${_namespace}" "${_name}" "${_context_ours}" "${_context_theirs}" "${_private_key}" "${_sealed_secrets_key}"
+  done
+}
+
+unseal_specific_path_by_comment() {
+  local values_file="$1"
+  local path="$2"
+  local scope="$3"
+  local namespace="$4"
+  local name="$5"
+  local context_ours="$6"
+  local context_theirs="$7"
+  local private_key="$8"
+  local sealed_secrets_key="$9"
+
+  local c=$("${yq_path}" e "${path} | {\"path\":path, \"value\":., \"prop\":(lineComment | split(\"${sealed_marker} \") | .1)}" "${values_file}" \
+            `# convert embedded comments into yaml` \
+  | sed -e "s/^prop: '/prop: /" -e "s/}'\$/}/" -e "s/''/'/g" \
+  | "${yq_path}" e '.' -)
+
+  local encrypted=$("${yq_path}" e "${path}" "${values_file}")
+  [ "${scope}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.scope' - &>/dev/null) && \
+    scope=$(echo "${c}" | "${yq_path}" e '.prop.scope' -)
+  [ "${namespace}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.namespace' - &>/dev/null) && \
+    namespace=$(echo "${c}" | "${yq_path}" e '.prop.namespace' -)
+  [ "${name}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.name' - &>/dev/null) && \
+    name=$(echo "${c}" | "${yq_path}" e '.prop.name' -)
+  [ "${context_theirs}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.context' - &>/dev/null) && \
+    context_theirs=$(echo "${c}" | "${yq_path}" e '.prop.context' -)
+  [ "${private_key}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.privateKey' - &>/dev/null) && \
+    private_key=$(echo "${c}" | "${yq_path}" e '.prop.privateKey' -)
+  [ "${sealed_secrets_key}" = '' ] && (echo "${c}" | "${yq_path}" -e e '.prop.sealedSecretsKey' - &>/dev/null) && \
+    sealed_secrets_key=$(echo "${c}" | "${yq_path}" e '.prop.sealedSecretsKey' -)
+
+  unseal "${path}" "${encrypted}" "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${private_key}" "${sealed_secrets_key}"
+}
+
+unseal_by_args() {
+  local values_file="$1"
+  local query="$2"
+  local scope="$3"
+  local namespace="$4"
+  local name="$5"
+  local context_ours="$6"
+  local context_theirs="$7"
+  local private_key="$8"
+  local sealed_secrets_key="$9"
+
+  for path in $("${yq_path}" e "${query} | path | join(\".\")" "${values_file}"); do
+    path=".${path}"
+
+    if [ "${extract_emb}" != '' ]; then
+      unseal_specific_path_by_comment "${values_file}" "${path}" "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${private_key}" "${sealed_secrets_key}"
+    else
+      local encrypted=$("${yq_path}" e "${path}" "${values_file}")
+      unseal "${path}" "${encrypted}" "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${private_key}" "${sealed_secrets_key}"
+    fi
+  done
+}
+
+unseal_by_config() {
+  local config="$1"
+  cd "$(dirname ${config})"
+
+  local len=$("${yq_path}" e 'length' "${config}")
+  local i=0
+  for ((i=0; i<${len}; i++)); do
+    local c=$("${yq_path}" e ".[${i}]" "${config}")
+    local values_files=()
+    local queries=()
+    local scope=''
+    local namespace=''
+    local name=''
+    local context=''
+    local controller_name=''
+
+    # get existing values
+    (echo "${c}" | "${yq_path}" -e e '.valuesFiles' - &>/dev/null) && \
+      values_files=($(echo "${c}" | "${yq_path}" e '.valuesFiles | join(" ")' -))
+    (echo "${c}" | "${yq_path}" -e e '.queries' - &>/dev/null) && \
+      queries=($(echo "${c}" | "${yq_path}" e '.queries | join(" ")' -))
+    (echo "${c}" | "${yq_path}" -e e '.scope' - &>/dev/null) && \
+      scope=$(echo "${c}" | "${yq_path}" e '.scope' -)
+    (echo "${c}" | "${yq_path}" -e e '.namespace' - &>/dev/null) && \
+      namespace=$(echo "${c}" | "${yq_path}" e '.namespace' -)
+    (echo "${c}" | "${yq_path}" -e e '.name' - &>/dev/null) && \
+      name=$(echo "${c}" | "${yq_path}" e ".name" -)
+    (echo "${c}" | "${yq_path}" -e e '.context' - &>/dev/null) && \
+      context=$(echo "${c}" | "${yq_path}" e ".context" -)
+    (echo "${c}" | "${yq_path}" -e e '.controllerName' - &>/dev/null) && \
+      controller_name=$(echo "${c}" | "${yq_path}" e '.controllerName' -)
+
+    for values_file in "${values_files[@]}"; do
+      for query in "${queries[@]}"; do
+        for path in $("${yq_path}" e "${query} | path | join(\".\")" "${values_file}"); do
+          local encrypted=($("${yq_path}" e ".${path}" "${values_file}"))
+          unseal "${path}" "${encrypted}" "${scope}" "${namespace}" "${name}" "${context}" "${context}" "${private_key}" "${sealed_secrets_key}"
+        done
+      done
+    done
+  done
+}
+
+seal() {
+  local values_file="$1"
+  local query="$2"
+  local scope="$3"
+  local namespace="$4"
+  local name="$5"
+  local context_ours="$6"
+  local context_theirs="$7"
+  local update="$8"
+
+  local paths=() # individual paths from given query
+  local check_queries=() # for checking if specified path's value is null or empty
+
+  local keys_list=$("${yq_path}" e "[${query} | path]" "${values_file}")
+  local len=$(echo "${keys_list}" | "${yq_path}" e 'length' -)
+  local i=0
+  for ((i=0; i<${len}; i++)); do
+    local path=''
+    local check_query=''
+    local keys=($(echo "${keys_list}" | "${yq_path}" e ".[${i}]" - | tr -d '\n' | sed -E 's/- / /g'))
+    local j=0
+    for ((j=0; j<${#keys[@]}; j++)); do
+      path="${path}.${keys[$j]}"
+      if [[ ${#keys[@]} -eq 1 && $j -eq 0 ]]; then # last && has only one key
+        if expr "${keys[$j]}" : '[0-9]*' >/dev/null || [[ "${keys[$j]}" =~ ^\" ]]; then # is an index or already quoted
+          check_query="has(${keys[$j]})"
+        else  # is not an index
+          check_query="has(\"${keys[$j]}\")"
+        fi
+      elif [[ $((${#keys[@]}-$j)) -eq 1 ]]; then # last
+        if expr "${keys[$j]}" : '[0-9]*' >/dev/null || [[ "${keys[$j]}" =~ ^\" ]]; then # is an index or already quoted
+          check_query="${check_query} | has(${keys[$j]})"
+        else  # is not an index
+          check_query="${check_query} | has(\"${keys[$j]}\")"
+        fi
+      else
+        check_query="${check_query}.${keys[$j]}"
+      fi
+    done
+    paths+=("${path}")
+    check_queries+=("${check_query}")
+  done
+
+  local i=0
+  for ((i=0; i<${#paths[@]}; i++)); do
+    if ! $("${yq_path}" -e e "${check_queries[$i]}" "${values_file}" 2>/dev/null); then
+      err "Invalid path: ${paths[$i]}"
+    fi
+
+    local secret=''
+    local encrypted=''
+
+    if [[ $("${yq_path}" -e e "${paths[$i]}" "${values_file}" &>/dev/null) || \
+          ! $("${yq_path}" e "${paths[$i]}" "${values_file}") =~ ^~?$ ]]; then # not null or empty
+      encrypted=$("${yq_path}" e "${paths[$i]}" "${values_file}")
+      if [ "${update}" = '' ]; then # if not update mode, doesn't seal not null or empty fields
+        log "Probably already encrypted ${values_file} (${paths[$i]}): ${encrypted:0:10}..."
+        continue
+      else # if update mode, doesn't seal not null or empty fields
+        read -sp "Enter secret for ${values_file} (${paths[$i]}) or empty for attempting to use existing secret: " secret
+        tty -s && echo
+        if [ "${secret}" = '' ]; then
+          # decrypt by old (from comment) meta info
+          # Notes:
+          # * $scope, $namespace, and $name $context are newer ones
+          # * Use dedicated keys for decryption while updating, only when specified
+          local kind_secret=$(\
+            unseal_specific_path_by_comment \
+              "${values_file}" "${paths[$i]}" '' '' '' '' '' \
+              "${private_key:-${private_key_for_decryption_while_updating}}" \
+              "${sealed_secrets_key:-${sealed_secrets_key_for_decryption_while_updating}}")
+          secret=$(echo "${kind_secret}" | "${yq_path}" e ".data.\"${paths[$i]}\"" - | ${base64_d})
+          if [ "${secret}" = '' ]; then
+            err "Failed to decrypt while updating: ${values_file} (${paths[$i]})"
+            continue
+          fi
+        fi
+      fi
+    else # null or empty
+      read -sp "Enter secret for ${values_file} (${paths[$i]}) or empty for skipping: " secret
+      tty -s && echo
+      [ "${secret}" = '' ] && continue
+    fi
+
+    encrypted=$(echo -n "${secret}" \
+    | "${kubeseal_path}" \
+      --raw \
+      --from-file=/dev/stdin \
+      --scope="${scope}" \
+      $([ "${namespace:+_}" ] && echo "--namespace=${namespace}") \
+      $([ "${name:+_}" ] && echo "--name=${name}") \
+      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}" ]) \
+      $([ "${context_ours:+_}" ] && echo "--context=${context_ours}"))
+    [ "${print_secrets}" = '' ] \
+    && log_v "<masked> -> ${encrypted}" \
+    || log_v "${secret} -> ${encrypted}"
+
+    if [ "${disable_emb}" = '' ]; then
+      # Write meta data for decryption as a comment
+      local info=$("${yq_path}" e -n ".scope = \"${scope}\" | .namespace = \"${namespace}\" | .name = \"${name}\" | .context = \"${context_theirs}\" style=\"flow\"")
+      local comment=$(echo "${sealed_marker} ${info}" | sed -e "s/\\\"/'/g")
+      "${yq_path}" e "${paths[$i]} = \"${encrypted}\"" -i "${values_file}"
+      "${yq_path}" e "${paths[$i]} lineComment=\"${comment}\"" -i "${values_file}"
+    fi
+  done
+}
+
+seal_by_args() {
+  local scope="$1"
+  local namespace="$2"
+  local name="$3"
+  local context_ours="$4"
+  local context_theirs="$5"
+  local update="$6"
+
+  [[ "${#values_files[@]}" -eq 0 || "${#queries[@]}" -eq 0 ]] && err "Specify at least one --values and --query"
+
+  ## Set scope/namespace/name
+  [[ -f "${infer_from}" ]] && infer "${infer_from}"
+  [[ "${scope}" = '' ]] && scope="${inferred_scope}"
+  [[ "${scope}" = '' ]] && scope="strict" # default scope is strict (when not specified && not inferred)
+  [[ "${namespace}" = '' ]] && namespace="${inferred_namespace}"
+  [[ "${name}" = '' ]] && name="${inferred_name}"
+
+  ## Validate scope/namespace/name
+  validate_scope "${scope}" "${namespace}" "${name}"
+
+  for values_file in "${values_files[0]}"; do
+    for query in "${queries[@]}"; do
+      seal "${values_file}" "${query}" "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${update}"
+    done
+  done
+}
+
+seal_by_config() {
+  local config="$1"
+  cd "$(dirname ${config})"
+
+  local update="$2"
+
+  local len=$("${yq_path}" e 'length' "${config}")
+  local i=0
+  for ((i=0; i<${len}; i++)); do
+    local c=$("${yq_path}" e ".[${i}]" "${config}")
+    local values_files=()
+    local queries=()
+    local scope=''
+    local namespace=''
+    local name=''
+    local context=''
+    local controller_name=''
+
+    # get existing values
+    (echo "${c}" | "${yq_path}" -e e '.valuesFiles' - &>/dev/null) && \
+      values_files=($(echo "${c}" | "${yq_path}" e '.valuesFiles | join(" ")' -))
+    (echo "${c}" | "${yq_path}" -e e '.queries' - &>/dev/null) && \
+      queries=($(echo "${c}" | "${yq_path}" e '.queries | join(" ")' -))
+    (echo "${c}" | "${yq_path}" -e e '.scope' - &>/dev/null) && \
+      scope=$(echo "${c}" | "${yq_path}" e '.scope' -)
+    (echo "${c}" | "${yq_path}" -e e '.namespace' - &>/dev/null) && \
+      namespace=$(echo "${c}" | "${yq_path}" e '.namespace' -)
+    (echo "${c}" | "${yq_path}" -e e '.name' - &>/dev/null) && \
+      name=$(echo "${c}" | "${yq_path}" e '.name' -)
+    (echo "${c}" | "${yq_path}" -e e '.context' - &>/dev/null) && \
+      context=$(echo "${c}" | "${yq_path}" e '.context' -)
+    (echo "${c}" | "${yq_path}" -e e '.controllerName' - &>/dev/null) && \
+      controller_name=$(echo "${c}" | "${yq_path}" e '.controllerName' -)
+
+    ## Validate scope/namespace/name
+    validate_scope "${scope}" "${namespace}" "${name}"
+
+    for values_file in "${values_files[@]}"; do
+      for query in "${queries[@]}"; do
+        seal "${values_file}" "${query}" "${scope}" "${namespace}" "${name}" "${context}" "${context}" "${update}"
+      done
+    done
+  done
+}
+
+infer() {
+  local infer_from="$1"
+
+  # clear before inferring
+  inferred_scope=''
+  inferred_namespace=''
+  inferred_name=''
+
+  if [[ $(grep 'sealedsecrets.bitnami.com/cluster-wide:' "${infer_from}" | grep true) ]]; then
+    inferred_scope='cluster-wide'
+  elif [[ $(grep 'sealedsecrets.bitnami.com/namespace-wide:' "${infer_from}" | grep true) ]]; then
+    inferred_scope='namespace-wide'
+    inferred_namespace=$(grep -oP '(?<= namespace: )[\w]+' "${infer_from}" | head -1)
+  else
+    inferred_scope='strict'
+    inferred_namespace=$(grep -oP '(?<= namespace: )[\w]+' "${infer_from}" | head -1)
+    iferred_name=$(grep -oP '(?<= name: )[\w]+' "${infer_from}" | head -1)
+  fi
+
+  log_v "Inferred from ${inferred_from}. scope='${inferred_scope}', namespace='${inferred_namespace}', name='${iferred_name}'"
+}
+
+
+if [ "${config}" != '' ]; then # Check config
+  [[ ! -f "${config}" ]] && err "Config specified but no such file: ${config}"
+fi
+
+if [ "${encrypt}" != '' ]; then # Encryption mode
+  if [ "${config}" != '' ]; then
+    # Encrypt-by-config mode
+    log_v "encryption-by-config: ${config}"
+    seal_by_config "${config}" "${update}"
+  else
+    # Encrypt-by-args mode
+    log_v "encryption-by-args: scope=${scope}, namespace=${namespace}, name=${name}"
+    seal_by_args "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${update}"
+  fi
+elif [ "${decrypt}" != '' ]; then # Decryption mode
+  if [ "${config}" != '' ]; then
+    log_v "decryption-by-config: config=${config}, extract_emb=${extract_emb}"
+    unseal_by_config "${config}" >/dev/null
+  elif [[ "${extract_emb}" != '' && ${#queries[@]} -eq 0 ]]; then
+    for values_file in "${values_files[@]}"; do
+      log_v "decryption-by-comment: scope=${scope}, namespace=${namespace}, name=${name}, context_ours=${context_ours}, context_theirs=${context_theirs}, private_key=${private_key}, sealed_secret_key=${sealed_secrets_key}, extract_emb=${extract_emb}"
+      unseal_by_comment "${values_file}" "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${private_key}" "${sealed_secrets_key}" >/dev/null
+    done
+  else
+    log_v "decryption-by-args: scope=${scope}, namespace=${namespace}, name=${name}, context_ours=${context_ours}, context_theirs=${context_theirs}, private_key=${private_key}, sealed_secret_key=${sealed_secrets_key}, extract_emb=${extract_emb}"
+    for values_file in "${values_files[@]}"; do
+      for query in "${queries[@]}"; do
+        unseal_by_args "${values_file}" "${query}" "${scope}" "${namespace}" "${name}" "${context_ours}" "${context_theirs}" "${private_key}" "${sealed_secrets_key}" >/dev/null
+      done
+    done
+  fi
+else
+  err 'Specify encrypt or decrypt as a subcommand'
+fi

@@ -1,0 +1,7 @@
+secrets:
+  - name: db_password
+    value: AgDDXV+gjKNivbyd10Jlqu1NminUmp/wSHx1Wd95O7MUV9uvQtq5iscLO4Y72X+fE0b1SYnte+TQJKSUUI2tjLnm6YonYyWdu/DPOKp0GWOTd9J0maBZHfVSruyqETLRQ31q39gdY0Ma8u5d8dmmcIeToUM4p//h3yZTJ7zrkx1LR61y9oxdkk8bngIIh73+lRbZs6Afq+VD8DDl/0lyIBQk4+t9qLLYdLXAG0+Kf3mQuBtTobH07l8aImS9bvyf6zlF6rfalksw+4J8/knRwJES53p+sm+SnM3UVSQEF8ddPopHY/2ELx3XiNi2UHAiceaw7o0K1CuBjEbmCERqMvn7y+lGZLp9Lvy1MEL8WF5ePjGr1L5HekVJzrV74JnoK19mpwLm1SEEV3gz6qw4MLzmdnz9/CNgzAOgAMeA7nSqNSN4kSqF3hRT17v0hVq36fI/czT2r0blbrMyHymf9nqq/c3dZEgwexHugW/fkMRpwbbV1+sfnw4pSUonPWpBIaTb4jQ0+PVC8iWkViebNz9Mpds8SHbdN7PtDHFlgCv7Su2/BYg627FJoEY6wB3LlsYDnRAw1XexRlOI9DPzIMlvvn/wkIqw7NSkVslY7szHQfCZ7ZB5hbJ+WpxzXitwYB2HX6hNj+hsi9i+aa3BxRhFncIPDynuQDQXC19VS7qkMQbmwGotnoSWAkY6srQjPPwvyBcZ4mM1BGPLY+0WjZzt6DwSG2yl # [sealed] {scope: strict, namespace: my-namespace, name: my-secret, context: kind-kind}
+  - name: api_secret
+    value:
+message: production
+secretMessage:

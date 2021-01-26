@@ -1,0 +1,22 @@
+# Use each context and name
+- valuesFiles:
+  - dev-values.yaml
+  context: dev
+  queries:
+  - .secrets[].value
+  - .secretMessage
+  scope: strict
+  namespace: my-dev-namespace
+  name: my-dev-secret
+  controllerName: sealed-secrets
+
+- valuesFiles:
+  - prd-values.yaml
+  context: prd
+  queries:
+  - .secrets[].value
+  - .secretMessage
+  scope: strict
+  namespace: my-prd-namespace
+  name: my-prd-secret
+  controllerName: sealed-secrets
