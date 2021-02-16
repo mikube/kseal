@@ -43,9 +43,9 @@ Usage:
   Encryption:
     * Select encryption targets
       * By a config file (See README on the GitHub repo for config format)
-        * `kseal enc -C .kseal.yaml`
+        * kseal enc -C .kseal.yaml
       * By arguments
-        * `kseal enc -f values1.yaml -f values2.yaml -q '.secrets[]' -q '.otherSecrets[].value' -n my-namespace -N my-secret`
+        * kseal enc -f values1.yaml -f values2.yaml -q '.secrets[]' -q '.otherSecrets[].value' -n my-namespace -N my-secret
     * How to encrypt
       * By a local key
         * (Not implemented)
@@ -54,20 +54,20 @@ Usage:
   Decryption:
     * Select decryption targets
       * By a config file (See README on the GitHub repo for config format)
-        * `kseal dec -C .kseal.yaml`
+        * kseal dec -C .kseal.yaml
       * By arguments
         * With embedded comments
-          * `kseal dec -f values3.yaml`
+          * kseal dec -f values3.yaml
         * Without embedded comments
-          * `kseal dec -f values3.yaml -q '.otherSecrets[].value' -n my-namespace -N my-secret`
+          * kseal dec -f values3.yaml -q '.otherSecrets[].value' -n my-namespace -N my-secret
     * How to decrypt
       * By a local private key
-        * `kseal dec -f values3.yaml -p private-key.yaml`
+        * kseal dec -f values3.yaml -p private-key.yaml
       * By a specified remote key
-        * `kseal dec -f values3.yaml -S sealed-secrets-key`
+        * kseal dec -f values3.yaml -S sealed-secrets-key
           * Can change remote by context
       * By any one of remote keys (brute force by sealedsecrets.bitnami.com/sealed-secrets-key label)
-        * `kseal dec -f values3.yaml`
+        * kseal dec -f values3.yaml
           * Can change remote by context
 Subcommands:
   e, enc, encrypt             Encryption mode
