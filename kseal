@@ -322,15 +322,17 @@ EOS
       --recovery-unseal \
       --format=yaml \
       --recovery-private-key="${private_key}" \
-      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") && :)
+      $([ "${context_ours:+_}" ] && echo "--context=${context_ours}") \
+      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") || :)
   elif [ "${sealed_secrets_key}" != '' ]; then # get a private key by name from remote and use it
     mode='specified_remote_key'
     secret=$(echo "${sealed_secret}" \
     | "${kubeseal_path}" \
       --recovery-unseal \
       --format=yaml \
-      --recovery-private-key=<(kubectl -n=kube-system get secret "${sealed_secrets_key}" -o=yaml) \
-      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") && :)
+      --recovery-private-key=<("${kubectl_path}" --context="${context_ours}" -n=kube-system get secret "${sealed_secrets_key}" -o=yaml) \
+      $([ "${context_ours:+_}" ] && echo "--context=${context_ours}") \
+      $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") || :)
   else # get private keys by name from remote and test&use it
     mode='remote_keys'
     local ns_key=($(kubectl get -A --context="${context_ours}" secret -l=sealedsecrets.bitnami.com/sealed-secrets-key -o=jsonpath='{range .items[*]}{.metadata.namespace} {.metadata.name} {end}'))
@@ -342,8 +344,9 @@ EOS
       | "${kubeseal_path}" \
         --recovery-unseal \
         --format=yaml \
-        --recovery-private-key=<(kubectl -n="${ns_key[$i]}" get secret "${ns_key[$i+1]}" -o=yaml) \
-        $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") 2>/dev/null && :)
+        --recovery-private-key=<("${kubectl_path}" --context="${context_ours}" -n="${ns_key[$i]}" get secret "${ns_key[$i+1]}" -o=yaml) \
+        $([ "${context_ours:+_}" ] && echo "--context=${context_ours}") \
+        $([ "${controller_name:+_}" ] && echo "--controller-name=${controller_name}") 2>/dev/null || :)
 
       [ "${secret}" != '' ] \
       && break \
